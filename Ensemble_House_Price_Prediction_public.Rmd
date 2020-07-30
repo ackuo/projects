@@ -1,0 +1,333 @@
+---
+title: 'House Prices: Ensemble Advanced Regression Techinique'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+setwd('/Users/alexkuo/Google Drive/Kaggle/House Price Prediction')
+```
+
+### Libraries
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(CatEncoders)
+library(caret)
+library(mlbench)
+library(mice)
+library(xgboost)
+library(ggcorrplot)
+library(corrplot)
+library(mltools)
+library(data.table)
+library(mlbench)
+library(caret)
+library(caretEnsemble)
+library(Boruta)
+library(parallel)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1) ## convention to leave 1 core for OS
+registerDoParallel(cluster)
+```
+
+## Data Extraction
+```{r}
+train = read.csv('/Users/alexkuo/Google Drive/Kaggle/House Price Prediction/Data/train.csv')
+test = read.csv('/Users/alexkuo/Google Drive/Kaggle/House Price Prediction/Data/test.csv')
+```
+
+# Data Imputation validation
+```{r}
+# Remove columns with NA over a certain threshold
+colSums(is.na(train))
+colSums(is.na(test))
+
+par(mfrow=c(1,2))
+plot(colSums(is.na(train)))
+plot(colSums(is.na(test)))
+```
+
+
+# Remove columns with high NaN threshold
+```{r}
+# Remove columns with NaN
+x_train <- train %>% select(-Id,-PoolQC,-Fence,-Alley,-MiscFeature)
+x_test <- test %>% select(-Id,-PoolQC,-Fence,-Alley,-MiscFeature)
+x_test$SalePrice <- 0
+
+# Combine rows together
+x_train <- rbind(x_train,x_test)
+```
+
+
+# Data Preparation
+# Label Encoding and use of One Hot Encoding
+```{r}
+x_train.new <- x_train
+
+# Find the string columns that are considered factors
+factors <- names(which(sapply(x_train, is.factor)))
+
+# Label Encoder
+for (i in factors){
+  encode <- LabelEncoder.fit(as.factor(x_train[!is.na(x_train[,i]),i]))
+  x_train.new[, i] <- transform(encode, x_train[, i])
+}  
+
+```
+
+# MICE() imputation
+```{r}
+x_train.imp = mice(x_train.new, meth= 'rf', seed = 12345, maxit = 10)
+x_train.new <- complete(x_train.imp, 1)
+
+colSums(is.na(x_train.new))
+```
+
+# Plot impuation
+```{r}
+densityplot(x_train.imp)
+```
+Blue represents the observed data and red shows the imputed data. These colours are consistent with what they represent from now on. 
+Here, we expect the red points (imputed data) have almost the same shape as blue points
+(observed data). Blue points are constant across imputed datasets, but red points differ
+from each other, which represents our uncertainty about the true values of missing data
+
+# Create new features 
+```{r}
+x_train.new$GarageSale = x_train.new$GarageCars * x_train.new$GarageArea
+x_train.new$AllPorch = x_train.new$OpenPorchSF + x_train.new$EnclosedPorch + x_train.new$ScreenPorch + x_train.new$X3SsnPorch
+x_train.new$AllFlrSF = x_train.new$X1stFlrSF +  x_train.new$X2ndFlrSF 
+x_train.new$BsmtFinishedAll = x_train.new$BsmtFinSF1 + x_train.new$BsmtFinSF2
+x_train.new$TotalSF = x_train.new$AllFlrSF + x_train.new$TotalBsmtSF
+
+```
+
+# Multiple Regression 
+# Identify coefficients that are not significant 
+# Represents a mean increase of 1 unit of the feature will increase to x value.
+```{r}
+tc <- trainControl(method = "cv", number = 10)
+lm_cv <- train(SalePrice~., data = x_train.new, method = "lm", trControl = tc)
+
+summary(lm_cv)
+```
+Statistical signficance indicates if there is a non-zero correlation between the response/dependant and independent variable.
+If p < 0.05 this means the variable is statistically significant to include into the model. Reject the null hypothesis that the parameter is non-zero correlation. In conclusion alot of the features can be dropped to improve interpretability of the model.
+
+### Outlier detection
+```{r}
+mod <- lm(SalePrice~., data = x_train.new)
+cooksd <- cooks.distance(mod)
+
+```
+In a regression model one of the most common problem is outliers. 
+Residual plot can clearly identify the outliers.
+
+```{r}
+plot(cooksd, pch="*", cex=2, main="Influential Obs by Cooks distance")  # plot cook's distance
+abline(h = 4*mean(cooksd, na.rm=T), col="red")  # add cutoff line
+text(x=1:length(cooksd)+1, y=cooksd, labels=ifelse(cooksd>4*mean(cooksd, na.rm=T),names(cooksd),""), col="red")  # add labels
+```
+
+# Cook's distance
+```{r}
+influential <- as.numeric(names(cooksd)[(cooksd > 4*mean(cooksd, na.rm=T))])  # influential row numbers
+head(x_train.new[influential, ])  # influential observations.
+```
+Cook’s distance is a measure computed with respect to a given regression model and therefore is impacted only by the X variables included in the model. But, what does cook’s distance mean? It computes the influence exerted by each data point (row) on the predicted outcome.
+
+# Outlier test
+```{r}
+car::outlierTest(mod)
+```
+Potential to drop these rows out of the train data set to stop the influence of the linear regression model
+
+
+## PCA - Exploratory Data Analysis ###
+```{r}
+
+pca_train <- x_train.new %>% select(-SalePrice)
+pca = prcomp(pca_train,scale. = T)
+names(pca)
+pca$center
+
+pca$rotation=-pca$rotation
+pca$x=-pca$x
+biplot(pca, scale=0)
+
+# Generate the loadings
+loadings <- as.data.frame(pca$x)
+#View(loadings)
+
+pca_matrix = pca$rotation
+
+# Variance explained by PCA
+std_dev <- pca$sdev
+pr_comp_var <- std_dev^2
+pr_comp_var
+
+# Proportion of variance explained in PC
+prop_var_ex <- pr_comp_var/sum(pr_comp_var)
+
+# PCA Chart, screeplot 
+par(mfrow=c(1,2))
+plot(prop_var_ex, xlab="Principal Component", ylab="Proportion of Variance Explained ", ylim=c(0,1),type="b")
+plot(cumsum(prop_var_ex), xlab = "Principal Component",ylab = "Proportion of Variance Explained",type = "b")
+
+y_train <- x_train.new %>% select(SalePrice)	
+loadings2 <- loadings[1:75]
+pca_train2 <- cbind(loadings2,y_train)
+#View(pca_train2)
+```
+Looking at the cumulative sum it doesn't seem like there is uncessary features to be dropped. There is not a positive PVE that features that has the largest proportion of principal components that can be explained the variance in the data.
+
+
+# Run linear regression analysis
+```{r}
+tc <- trainControl(method = "cv", number = 10)
+lm_cv2 <- train(SalePrice~., data = pca_train2, method = "lm", trControl = tc)
+
+summary(lm_cv2)
+```
+
+
+# Not necessary to convert into factors
+```{r}
+# Convert into factors
+factor_names <- names(lapply(x_train[sapply(x_train, is.factor)], levels))
+
+for(i in factor_names) {
+  x_train.new[,i] <- as.factor(x_train.new[,i])
+}
+```
+
+
+### Feature Engineering ###
+# One Hot encoding
+# Examples of one-hot encoding: https://datatricks.co.uk/one-hot-encoding-in-r-three-simple-methods
+```{r}
+# Using mltools
+x_train.new <- one_hot(as.data.table(x_train.new))
+
+```
+
+# Feature selection using Boruta
+```{r}
+boruta_output <- Boruta(SalePrice ~ ., data=x_train.new, doTrace=0)  
+
+boruta_signif <- getSelectedAttributes(boruta_output, withTentative = TRUE)
+print(boruta_signif) 
+
+# Do a tentative rough fix
+roughFixMod <- TentativeRoughFix(boruta_output)
+boruta_signifMod <- getSelectedAttributes(roughFixMod)
+print(boruta_signifMod)
+
+# Plot variable importance
+plot(boruta_output, cex.axis=.7, las=2, xlab="", main="Variable Importance")  
+```
+The columns in green are ‘confirmed’ and the ones in red are not.
+
+```{r}
+x_train.new.short <- as.data.frame(x_train.new$SalePrice)
+names(x_train.new.short) <- "SalePrice"
+
+for (i in boruta_signif) {
+  x_train.new.short <- cbind(x_train.new.short,x_train.new[[i]])
+}
+
+boruta_signifNm<-c("SalePrice",boruta_signif)
+
+names(x_train.new.short) <- c(boruta_signifNm)
+
+x_train.new <- x_train.new.short
+```
+
+## Scaling data
+```{r}
+preproc <- preProcess(x_train.new[,1:(ncol(x_train.new))] %>% select(-SalePrice), method=c("center", "scale"))
+x_train.new.norm <- predict(preproc,x_train.new[,1:(ncol(x_train.new))] %>% select(-SalePrice))
+#summary(x_train.new.norm)
+
+# Log-SalePrice
+y_train <- as.data.frame(log(x_train.new$SalePrice))
+names(y_train) <- "SalePrice"
+x_train.new.norm <- cbind(x_train.new.norm, y_train)
+
+```
+
+# Data Validation 
+```{r}
+
+x_test.new <- x_train.new.norm[x_train.new$SalePrice ==  0,] %>% select(-SalePrice)
+x_train.new <- x_train.new.norm[x_train.new$SalePrice > 0,]
+
+str(x_train.new)
+str(x_test.new)
+```
+Confirm whether the data has been modified to convert string fields into numeric values
+
+## Data Exploration
+## Correlation Matrix heatmap
+```{r}
+dim(x_train.new)
+dim(x_test.new)
+
+# Correlation Matrix rounded to the nearest 2 decimals
+corr <- round(cor(x_train.new), 2)
+
+ggcorrplot(corr, hc.order = TRUE, type = "lower", outline.col="white")
+
+#corrplot(corr, method="number")
+```
+
+
+# Stacking Alogrithms
+```{r}
+control <- trainControl(method="repeatedcv", number = 10, repeats=3, savePredictions=TRUE)
+
+mtry <- round(sqrt(ncol(x_train.new)))-1
+xgbTreeGrid <- expand.grid(nrounds = 3000, max_depth = seq(2,16,by = 2), eta = seq(0.05,0.1,by = 0.01), gamma = 0, colsample_bytree = 0.9,  subsample = 0.8, min_child_weight = 1)
+
+glmnetGridElastic <- expand.grid(.alpha = 0.3, .lambda = 0.009) ## notice the . before the parameter
+glmnetGridLasso <- expand.grid(.alpha = 1, .lambda = seq(0.001,0.1,by = 0.001))
+glmnetGridRidge <- expand.grid(.alpha = 0, .lambda = seq(0.001,0.1,by = 0.001))
+rfGrid <- expand.grid(.mtry=c(2:mtry))
+
+
+algorithmList = c('rf', 'knn', 'glmnet', 'gbm', 'xgbTree', 'glm')
+
+tuneList <- list(
+              rf=caretModelSpec(method="rf", tuneGrid=rfGrid),
+              xgbTree = caretModelSpec(method="xgbTree",  tuneGrid = xgbTreeGrid, nthread = 8),
+              glmnet=caretModelSpec(method="glmnet", tuneGrid = glmnetGridElastic),
+              glmnet=caretModelSpec(method="glmnet", tuneGrid = glmnetGridLasso), ## Lasso
+              glmnet=caretModelSpec(method="glmnet", tuneGrid = glmnetGridRidge) ## Ridge
+              )
+
+set.seed(123)
+
+models <- caretList(SalePrice~., data=x_train.new, trControl=control,methodList=algorithmList, tuneList =tuneList)
+results<-resamples(models)
+summary(results)
+dotplot(results)
+
+modelCor(results)
+splom(results)
+
+set.seed(1234)
+stackControl <- trainControl(method="repeatedcv", number=10, repeats=3, savePredictions=TRUE)
+stack.rf <- caretStack(models, method ="rf", metric="RMSE", trControl = stackControl)
+
+```
